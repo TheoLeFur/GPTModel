@@ -11,7 +11,7 @@ class PreprocessData(object):
             url: str = None,
             encoding_str: str = "gpt2",
             train_size: int = 0.9,
-    ):
+    ) -> None :
         """
         Initialize a PreprocessData class.
         :param url: request the data from this url
@@ -48,7 +48,7 @@ class PreprocessData(object):
         self.val_idx = np.array(self.encoding.encode_ordinary(self.val_data), dtype=np.uint16)
 
     @property
-    def data_len(self):
+    def data_len(self) -> int:
         """
         Access the length of the data
         :return: data length : int
@@ -56,14 +56,14 @@ class PreprocessData(object):
         return len(self.data)
 
     @property
-    def get_data(self):
+    def get_data(self) -> str:
         """
         Access the data through a getter.
         :return: data : str
         """
         return self.data
 
-    def train_val_to_file(self, train_file, val_file):
+    def train_val_to_file(self, train_file :str , val_file : str) -> None:
 
         """
         Save the tokens in two binary files so that we can access it later.
