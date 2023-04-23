@@ -2,177 +2,235 @@ import numpy as np
 import torch
 import torch.nn as nn
 import unittest
+import math
 import torch.nn.functional as F
 from typing import Optional, Union, Tuple, Type, Any
 
 from torch import FloatTensor, Tensor
 
-# TODO : Make MultiHeadAttention
+
 # TODO : Make Block
 # TODO : Make Encoder
 # TODO : Make Decoder
 # TODO : Make LayerNorm
 
-
-"""
-
-B       :       batch size
-S       :       source sequence length 
-T       :       target sequence length
-D       :       embedding dimension 
-
-
-We will make a table of tensors dimension to make our life easier 
-
-------------------------------------------
-Tensor Name         | Tensor Dim
-------------------------------------------
-Source/Target (integer tensor) [B, S or T]
-------------------------------------------
-Embedded Source (float tensor) [B, S, D].            
-------------------------------------------
-Embedded source reshape  [B, S, H, D/H]
-------------------------------------------
-                    |                                    
-"""
-
-
 class MultiHeadAttention(nn.Module):
 
-    def __init__(
-            self,
-            hidden_dim: int,
-            num_heads: int) -> None:
-
+    def __init__(self,
+                 d_model: int = 512,
+                 n_heads: int = 8):
         super(MultiHeadAttention, self).__init__()
 
-        assert hidden_dim % num_heads == 0
+        assert d_model % n_heads == 0
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.qkv_dim = self.d_model // self.n_heads
 
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
-        self.qkv_dim = self.hidden_dim // self.num_heads
-        self.qkv_projection = nn.Linear(hidden_dim, 3 * hidden_dim, bias=False)
-        self.output_projection = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.qkv_proj = nn.Linear(self.d_model, 3 * self.d_model, bias=False)
+        self.o_proj = nn.Linear(self.d_model, self.d_model, bias=False)
 
-    def forward(
-            self,
-            x: torch.Tensor,
-            mask: torch.BoolTensor,
-            cross_attention: bool = False,
-    ):
+    def forward(self,
+                x: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.size()
+        queries, keys, values = self.qkv_proj(x).split(self.d_model, dim=-1)
 
-        """
-        We realise the forward pass of the MultiHeadAttentionBlock. We query the keys and values, and then compute the
-        resulting attention score. We then project the values using the output projection.
-        :param x: source sequence tensor. Shape : [B, S, E]
-        :param mask: mask for the scaled dot product attention
-        :param cross_attention: indicates whether we do cross attention.
-        :return: output projection.Shape : [B, E, E]
-        """
-
-        B, S, E = x.size()
-        if cross_attention:
-            queries, keys, values = self.cross_attention_projection(x)
-        else:
-            queries, keys, values = self.self_attention_projection(x)
-
+        # One now needs to reshape the tensors in order to compute the scaled dot product attention
         queries, keys, values = map(
-            lambda x: x.permute(0, 2, 1, 3),
+            lambda x: x.view(B, T, self.n_heads, self.qkv_dim).transpose(1, 2),
             [queries, keys, values]
         )
 
         values, attn_score = self.scaled_dot_product_attention(
-            queries=queries,
-            keys=keys,
-            values=values,
-            mask=mask
+            queries,
+            keys,
+            values,
         )
 
-        values = values.reshape(B, S, E)
-        output = self.output_projection(values)
+        attn_score = attn_score.transpose(1, 2).contiguous().view(B, T, D)
+        return self.o_proj(attn_score)
+
+    def scaled_dot_product_attention(self,
+                                     queries: torch.FloatTensor,
+                                     keys: torch.FloatTensor,
+                                     values: torch.FloatTensor,
+                                     mask: Optional[torch.BoolTensor] = None) -> Tuple[FloatTensor, Tensor]:
+        """
+        Scaled dot product attention as presented in the Attention is All You Need Paper.
+
+        :param queries: input shape of [B, H, T, D/H]
+        :param keys: input shape of [B, H, T, D/H]
+        :param values: input shape of [B, H, T, D/H]
+        :param mask: optional masking out of illegal connections in the decoder's self attention mechanism. Prevents the corruption
+        of the autoregressive property of the transformer.
+        :return: value and attention score.
+        """
+
+        attention_logits = torch.matmul(queries, torch.transpose(keys, -1, -2)) / math.sqrt(self.qkv_dim)
+        if mask is not None:
+            torch.masked_fill(attention_logits, mask[:, None, None, :] == 0, np.NINF)
+        softmax = F.softmax(attention_logits, dim=-1)
+        # We multiply [B, H, T, T] * [B, H, T, D/H] -> [B, H, T, D/H]
+        attn_score = torch.matmul(softmax, values)
+        return values, attn_score
+
+
+class LayerNorm(nn.Module):
+    def __init__(self,
+                 d_model: int = 512) -> None:
+        """
+        We implement Layer Normalisation, since the devs where too lazy to implement
+        it for the mps gpu, one does not need to do it if you use cuda or your cpu.
+        :param d_model: hidden dim of your model
+
+        """
+
+        super(LayerNorm, self).__init__()
+
+        self.d_model = d_model
+        self.gamma = nn.Parameter(torch.ones(self.d_model))
+        self.beta = nn.Parameter(torch.zeros(self.d_model))
+        self.eps = 1e-12
+
+    def forward(self,
+                x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the layer norm
+        :param x: input tensor
+        :return: learn normalization of the layer.
+        """
+        mean = torch.mean(x, dim=-1, keepdim=True)
+        var = torch.var(x, dim=-1, unbiased=False, keepdim=True)
+        out = (x - mean) / (torch.sqrt(var) + self.eps) * self.gamma + self.beta
+        return out
+
+
+class DoubleMLP(nn.Module):
+
+    def __init__(self,
+                 config: dict,
+                 hidden_activation: nn.Module = None,
+                 output_activation: nn.Module = None):
+
+        super(DoubleMLP, self).__init__()
+
+        self.config = config
+        self.d_model = config["d_model"]
+        self.dropout = config["dropout"]
+        self.bias = config['bias']
+
+        if hidden_activation is None:
+            self.hidden_activation = nn.GELU()
+        else:
+            self.hidden_activation = hidden_activation
+        if output_activation is None:
+            self.output_activation = nn.Identity()
+        else:
+            self.output_activation = output_activation
+
+        self.double_mlp = nn.Sequential(
+            nn.Linear(self.d_model, 4 * self.d_model, bias=self.bias),
+            self.hidden_activation,
+            nn.Linear(4 * self.d_model, self.d_model, bias=self.bias),
+            nn.Dropout(self.dropout),
+            self.output_activation
+        )
+
+    def forward(self,
+                x: torch.Tensor):
+
+        """
+        Forward pass for the double-headed MLP
+        :param x: input tensor
+        :return : output tensor
+        """
+        output = self.double_mlp(x)
         return output
 
-    def self_attention_projection(
-            self,
-            x: torch.Tensor) -> Tuple[Any, Any, Any]:
 
+class TransformerBlock(nn.Module):
+
+    def __init__(self,
+                 config: dict,
+                 hidden_activation: nn.Module = None,
+                 output_activation: nn.Module = None) -> torch.Tensor:
+
+        super(TransformerBlock, self).__init__()
+
+        self.config = config
+        self.d_model = self.config["d_model"]
+        self.bias = self.config["bias"]
+        self.n_heads = config["n_heads"]
+
+        if hidden_activation is None:
+            self.hidden_activation = nn.GELU()
+        else:
+            self.hidden_activation = hidden_activation
+        if output_activation is None:
+            self.output_activation = nn.Identity()
+        else:
+            self.output_activation = output_activation
+
+        self.attention_block = nn.Sequential(
+            MultiHeadAttention(self.n_heads),
+            LayerNorm(self.d_model)
+        )
+
+        self.feedforward_nn_block = nn.Sequential(
+            DoubleMLP(
+                config=self.config,
+                hidden_activation=self.hidden_activation,
+                output_activation=self.output_activation
+            ),
+            LayerNorm(self.d_model),
+        )
+
+    def forward(self,
+                x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attention_block(x)
+        x = x + self.feedforward_nn_block(x)
+        return x
+
+
+class PositionalEncoding(nn.Module):
+
+    def __init__(self,
+                 config: dict) -> None:
+        super(PositionalEncoding, self).__init__()
+
+        self.d_model = config["d_model"]
+        self.device = config["device"]
+        self.max_len = config["max_len"]
+
+        self.encoding = torch.zeros(self.max_len, self.d_model, device=self.device)
+        self.encoding.requires_grad = False
+        pos = torch.arange(0, self.max_len, device=self.device).float().unsqueeze(1)
+
+        powers = torch.arange(0, self.d_model, step=2, device=self.device).float()
+
+        self.encoding[:, 0::2] = torch.sin(pos /
+                                           (10000 ** (powers / self.d_model)))
+        self.encoding[:, 1::2] = torch.cos(pos /
+                                           (10000 ** (powers / self.d_model)))
+
+    def forward(self,
+                x: torch.Tensor) -> torch.FloatTensor:
         """
-        An auxiliary method for the projection that takes care of reshaping various tensors. We pass in
-        a source/target sequence of shape [B, S or T, E], reshapes it into [B, S, H, E//H] and outputs
-        queries,  keys and values
+        We return a positional encoding for the input token. we have to track somehow the position of the token in the
+        sentence, else will we use order in the reconstruction. If we do not use this, phrase like :
+        1. The cat ate the mouse
+        2. The mouse ate the cat
+        3. The the mouse ate cat
 
-        :param x: source sequence tensor of size [B, S or T, E]
-        :return: queries, keys and values of shape [B, S, H, E/H]
+        Would be equally likely, which is something we do not want, obviously.
+
+        :param x: tensor
+        :returns positional encoding of the tensor
         """
-
-        B, S, E = x.shape
-        qkv_proj = self.qkv_projection(x)
-        qkv_proj = qkv_proj.view(B, S, self.num_heads, 3 * self.qkv_dim)
-        queries, keys, values = torch.chunk(qkv_proj, chunks=3, dim=-1)
-        return queries, keys, values
-
-    def cross_attention_projection(
-            self,
-            x: torch.Tensor
-    ) -> Tuple[Any, Any, Any]:
-        raise NotImplementedError
-
-    def cross_attention_projection(
-            self,
-            encoder_hidden_state: torch.Tensor,
-            decoder_hidden_state: torch.Tensor
-    ) -> Tuple[Type[FloatTensor], Tensor]:
-
-        batch_size, src_sequence_length, embed_dim = encoder_hidden_state.shape
-        batch_size, target_sequence_length, embed_dim = decoder_hidden_state.shape
-
-    def scaled_dot_product_attention(
-            self,
-            queries: torch.FloatTensor,
-            keys=torch.FloatTensor,
-            values=torch.FloatTensor,
-            source_padding_mask: Optional[torch.BoolTensor] = None,
-            future_padding_mask: Optional[torch.BoolTensor] = None,
-    ) -> Tuple[Type[FloatTensor], Tensor]:
-        """
-
-        We implement the simple scaled dot product attention. We let
-
-        B       : batch size
-        H       : number of heads
-        S       : source sequence length
-        T       : target sequence length
-        E       : embedding dimensionality
+        batch_size, seq_len = x.size()
+        return self.encoding[:seq_len, :]
 
 
-        :param queries: tensor containing queries. Shape : [B, H, S or T, E // H]
-        :param keys: tensor containing the keys. Shape : [B, H, S or T, E // H]
-        :param values: tensor containing the value tokens : Shape : [B, H, S or T, E // H]
-        :param source_padding_mask: optional masking of source sequence.
-        :param future_padding_mask: optional masking of future values
-        :return: values, attention score. Shape of attention score : [B, S or T, E]
-        """
+class TransformerEncoderBlock(nn.Module):
 
-        attention_keys = torch.matmul(queries, torch.transpose(keys, -2, -1))
-        attention_keys /= torch.sqrt(self.queries.size()[-1])
-        attention_logits = F.softmax(attention_keys, dim=-1)
-
-        if source_padding_mask is not None or future_padding_mask is not None:
-            self.mask_future_values(attention_logits, source_padding_mask, future_padding_mask)
-
-        attention_score = torch.matmul(attention_logits, values)
-        return values, attention_score
-
-    @staticmethod
-    def mask_future_values(
-            logits: torch.Tensor,
-            source_padding_mask: torch.BoolTensor,
-            future_padding_mask: torch.BoolTensor
-    ):
-
-        global masked_logits
-        if source_padding_mask is not None:
-            masked_logits = torch.masked_fill(logits, source_padding_mask[:, None, None, :], np.NINF)
-        if future_padding_mask is not None:
-            masked_logits = torch.masked_fill(logits, future_padding_mask[:, None, None, :], np.NINF)
-        return masked_logits
+    def __init__(self,
+                 ):
