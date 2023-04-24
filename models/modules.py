@@ -1,18 +1,16 @@
-import numpy as np
+i
+conda 
+mpy as np
 import torch
 import torch.nn as nn
 import unittest
 import math
 import torch.nn.functional as F
 from typing import Optional, Union, Tuple, Type, Any
-
 from torch import FloatTensor, Tensor
 
 
-# TODO : Make Block
-# TODO : Make Encoder
-# TODO : Make Decoder
-# TODO : Make LayerNorm
+# TODO : Implement masking of future values in the decoder to preserve autoregressive property.
 
 class MultiHeadAttention(nn.Module):
 
@@ -137,7 +135,6 @@ class DoubleMLP(nn.Module):
 
     def forward(self,
                 x: torch.Tensor):
-
         """
         Forward pass for the double-headed MLP
         :param x: input tensor
@@ -171,17 +168,17 @@ class TransformerBlock(nn.Module):
             self.output_activation = output_activation
 
         self.attention_block = nn.Sequential(
+            LayerNorm(self.d_model),
             MultiHeadAttention(self.n_heads),
-            LayerNorm(self.d_model)
         )
 
         self.feedforward_nn_block = nn.Sequential(
+            LayerNorm(self.d_model),
             DoubleMLP(
                 config=self.config,
                 hidden_activation=self.hidden_activation,
                 output_activation=self.output_activation
-            ),
-            LayerNorm(self.d_model),
+            )
         )
 
     def forward(self,
@@ -230,7 +227,49 @@ class PositionalEncoding(nn.Module):
         return self.encoding[:seq_len, :]
 
 
-class TransformerEncoderBlock(nn.Module):
+class TransformerDecoder(nn.Module):
 
     def __init__(self,
-                 ):
+                 config,
+                 ) -> None:
+        """
+        We create a transformer decoder, which will be the only one we need for a generative pretrained transformer.
+        Hence, we do not make usage of the full transformer architecture.
+
+        :param config: configure the params for the model
+        """
+
+        super(TransformerDecoder, self).__init__()
+
+        self.n_blocks = config["n_blocks"]
+        self.vocab_len = config["vocab_len"]
+        self.max_len = config["max_len"]
+        self.d_model = config["d_model"]
+        self.dropout_p = config["dropout"]
+        self.bias = config["bias"]
+        self.word_embedding = nn.Embedding(self.vocab_len, self.d_model)
+        self.pos_encoding = PositionalEncoding(config)
+        self.dropout = nn.Dropout(self.dropout_p)
+
+        self.dropout = nn.Dropout(self.dropout_p)
+        module_list = [TransformerBlock(config) for _ in self.n_blocks]
+        self.transformer_decoder = nn.Sequential(
+            *module_list,
+            LayerNorm(self.d_model)
+        )
+        self.head = nn.Linear(self.d_model, self.vocab_len, bias=self.bias)
+
+    def forward(self,
+                idx: torch.Tensor,
+                targets: torch.Tensor = None) -> Tuple[torch.Tensor, Optional[Tensor]]:
+        b, t = idx.size()
+        x = self.dropout(self.word_embedding(idx) + self.pos_encoding(idx))
+        x = self.transformer_decoder(x)
+
+        logits = self.head(x)
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        else:
+            loss = None
+
+        return logits, loss
