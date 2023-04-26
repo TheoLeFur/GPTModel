@@ -1,12 +1,10 @@
-i
-conda 
-mpy as np
 import torch
 import torch.nn as nn
+import numpy as np
 import unittest
 import math
 import torch.nn.functional as F
-from typing import Optional, Union, Tuple, Type, Any
+from typing import Optional, Tuple
 from torch import FloatTensor, Tensor
 
 
@@ -15,17 +13,37 @@ from torch import FloatTensor, Tensor
 class MultiHeadAttention(nn.Module):
 
     def __init__(self,
+                 block_size: int,
                  d_model: int = 512,
-                 n_heads: int = 8):
+                 n_heads: int = 8,
+                 ):
+
+        """
+
+        Multiple head attention module. We linearly project the queries, keys and values onto the learned projections,
+        and then incorporate the attention mechanism in parallel. We then aggregate the attention scores of each head
+        and pass it through an output projection layer.
+
+        :param block_size: necessary for masking
+        :param d_model: hidden dimension across the model, 512 by default
+        :param n_heads: number of heads in which we run the attention mechanism in parallel.
+
+        """
         super(MultiHeadAttention, self).__init__()
 
         assert d_model % n_heads == 0
+
         self.d_model = d_model
         self.n_heads = n_heads
         self.qkv_dim = self.d_model // self.n_heads
+        self.block_size = block_size
 
         self.qkv_proj = nn.Linear(self.d_model, 3 * self.d_model, bias=False)
         self.o_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.register_buffer("mask", torch.tril(torch.ones(
+            self.block_size, self.block_size
+        )).view(1, 1, self.block_size, self.block_size)
+                             )
 
     def forward(self,
                 x: torch.Tensor) -> torch.Tensor:
@@ -42,10 +60,12 @@ class MultiHeadAttention(nn.Module):
             queries,
             keys,
             values,
+            mask=self.mask
         )
 
         attn_score = attn_score.transpose(1, 2).contiguous().view(B, T, D)
         return self.o_proj(attn_score)
+
 
     def scaled_dot_product_attention(self,
                                      queries: torch.FloatTensor,
@@ -62,10 +82,10 @@ class MultiHeadAttention(nn.Module):
         of the autoregressive property of the transformer.
         :return: value and attention score.
         """
-
+        T = queries.shape[2]
         attention_logits = torch.matmul(queries, torch.transpose(keys, -1, -2)) / math.sqrt(self.qkv_dim)
         if mask is not None:
-            torch.masked_fill(attention_logits, mask[:, None, None, :] == 0, np.NINF)
+            torch.masked_fill(attention_logits, mask[:, :, :T, :T] == 0, np.NINF)
         softmax = F.softmax(attention_logits, dim=-1)
         # We multiply [B, H, T, T] * [B, H, T, D/H] -> [B, H, T, D/H]
         attn_score = torch.matmul(softmax, values)
@@ -252,7 +272,7 @@ class TransformerDecoder(nn.Module):
         self.dropout = nn.Dropout(self.dropout_p)
 
         self.dropout = nn.Dropout(self.dropout_p)
-        module_list = [TransformerBlock(config) for _ in self.n_blocks]
+        module_list = [TransformerBlock(config) for _ in range(self.n_blocks)]
         self.transformer_decoder = nn.Sequential(
             *module_list,
             LayerNorm(self.d_model)
@@ -273,3 +293,21 @@ class TransformerDecoder(nn.Module):
             loss = None
 
         return logits, loss
+
+if __name__ == "__main__":
+
+    config = dict(
+        vocab_len = 10000,
+        max_len = 100,
+        d_model = 512,
+        dropout = 0.1,
+        bias = False,
+        n_blocks = 12,
+        device = "cpu",
+        n_heads = 8
+    )
+
+    idx = torch.randn(32, 100)
+    decoder = TransformerDecoder(config)
+    decoder(idx)
+
