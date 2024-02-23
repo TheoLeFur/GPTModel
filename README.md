@@ -1,2 +1,2 @@
-# GPTModel
-An implementation of a Transformer for generative pertaining. 
+# About
+We give an implementation of a transformer for generative pretraining.
